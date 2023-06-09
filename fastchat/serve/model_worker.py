@@ -8,10 +8,12 @@ import logging
 import json
 import os
 import time
+import traceback
 from typing import List, Union
 import threading
 import uuid
 
+import guidance
 from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import StreamingResponse, JSONResponse
 import requests
@@ -37,7 +39,7 @@ import uvicorn
 from fastchat.constants import WORKER_HEART_BEAT_INTERVAL, ErrorCode, SERVER_ERROR_MSG
 from fastchat.model.model_adapter import load_model, add_model_args
 from fastchat.model.chatglm_model import chatglm_generate_stream
-from fastchat.serve.inference import generate_stream
+from fastchat.serve.inference import generate_stream, generate_guidance
 from fastchat.utils import build_logger, pretty_print_semaphore
 
 GB = 1 << 30
@@ -63,7 +65,7 @@ class ModelWorker:
         worker_id,
         no_register,
         model_path,
-        model_names,
+        model_name,
         device,
         num_gpus,
         max_gpu_memory,
@@ -75,10 +77,10 @@ class ModelWorker:
         self.worker_id = worker_id
         if model_path.endswith("/"):
             model_path = model_path[:-1]
-        self.model_names = model_names or [model_path.split("/")[-1]]
+        self.model_name = model_name or model_path.split("/")[-1]
         self.device = device
 
-        logger.info(f"Loading the model {self.model_names} on worker {worker_id} ...")
+        logger.info(f"Loading the model {self.model_name} on worker {worker_id} ...")
         self.model, self.tokenizer = load_model(
             model_path, device, num_gpus, max_gpu_memory, load_8bit, cpu_offloading
         )
@@ -98,6 +100,11 @@ class ModelWorker:
             self.generate_stream_func = chatglm_generate_stream
         else:
             self.generate_stream_func = generate_stream
+
+        # support for guidance completion api
+        logger.info(f"Creating guidance wrapper for {self.model_name} on worker {worker_id} ...")
+        self.guidance_llm = guidance.llms.Transformers(model=self.model, tokenizer=self.tokenizer, device=self.device)
+        self.generate_guidance_func = generate_guidance
 
         if not no_register:
             self.register_to_controller()
@@ -120,7 +127,7 @@ class ModelWorker:
 
     def send_heart_beat(self):
         logger.info(
-            f"Send heart beat. Models: {self.model_names}. "
+            f"Send heart beat. Models: {[self.model_name]}. "
             f"Semaphore: {pretty_print_semaphore(model_semaphore)}. "
             f"global_counter: {global_counter}"
         )
@@ -162,7 +169,7 @@ class ModelWorker:
 
     def get_status(self):
         return {
-            "model_names": self.model_names,
+            "model_names": [self.model_name],
             "speed": 1,
             "queue_length": self.get_queue_length(),
         }
@@ -242,13 +249,42 @@ class ModelWorker:
             }
         return ret
 
+    def generate_guidance_gate(self, params):
+        try:
+            logger.info(str(params))
+            ret = {"text": "", "error_code": 0}
+            for output in self.generate_guidance_func(
+                self.guidance_llm,
+                self.tokenizer,
+                params
+            ):
+                ret["text"] = output["text"]
+            if "usage" in output:
+                ret["usage"] = output["usage"]
+            if "finish_reason" in output:
+                ret["finish_reason"] = output["finish_reason"]
+        except torch.cuda.OutOfMemoryError as e:
+            ret = {
+                "text": f"{SERVER_ERROR_MSG}\n\n({e})",
+                "error_code": ErrorCode.CUDA_OUT_OF_MEMORY,
+            }
+        except (ValueError, RuntimeError) as e:
+            ret = {
+                "text": f"{SERVER_ERROR_MSG}\n\n({e})",
+                "error_code": ErrorCode.INTERNAL_ERROR,
+            }
+        except Exception as e:
+            ret = {
+                "text": f"Guidance Error\n\n({traceback.format_exc(e)})",
+                "error_code": ErrorCode.INTERNAL_ERROR,
+            }
+        return ret
+
     @torch.inference_mode()
     def get_embeddings(self, params):
         try:
             tokenizer = self.tokenizer
-            is_llama = "llama" in str(
-                type(self.model)
-            )  # vicuna support batch inference
+            is_llama = "llama" in str(type(self.model)) # vicuna support batch inference
             is_chatglm = "chatglm" in str(type(self.model))
             is_t5 = "t5" in str(type(self.model))
             if is_llama:
@@ -279,9 +315,7 @@ class ModelWorker:
                         self.device
                     )
                     if is_t5:
-                        model_output = self.model(
-                            input_ids, decoder_input_ids=input_ids
-                        )
+                        model_output = self.model(input_ids, decoder_input_ids=input_ids)
                     else:
                         model_output = self.model(input_ids, output_hidden_states=True)
                     if is_chatglm:
@@ -362,7 +396,10 @@ async def api_generate_completion_stream(request: Request):
 async def api_generate_completion(request: Request):
     params = await request.json()
     await acquire_model_semaphore()
-    completion = worker.generate_gate(params)
+    if params.get("use_guidance"):
+        completion = worker.generate_guidance_gate(params)
+    else:
+        completion = worker.generate_gate(params)
     background_tasks = create_background_tasks()
     return JSONResponse(content=completion, background=background_tasks)
 
@@ -401,11 +438,7 @@ if __name__ == "__main__":
         "--controller-address", type=str, default="http://localhost:21001"
     )
     add_model_args(parser)
-    parser.add_argument(
-        "--model-names",
-        type=lambda s: s.split(","),
-        help="Optional display comma separated names",
-    )
+    parser.add_argument("--model-name", type=str, help="Optional display name")
     parser.add_argument("--limit-model-concurrency", type=int, default=5)
     parser.add_argument("--stream-interval", type=int, default=2)
     parser.add_argument("--no-register", action="store_true")
@@ -425,7 +458,7 @@ if __name__ == "__main__":
         worker_id,
         args.no_register,
         args.model_path,
-        args.model_names,
+        args.model_name,
         args.device,
         args.num_gpus,
         args.max_gpu_memory,

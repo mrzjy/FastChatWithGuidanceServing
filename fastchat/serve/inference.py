@@ -1,12 +1,14 @@
 """Inference for FastChat models."""
 import abc
 import gc
+import json
+import logging
 import math
 from typing import Iterable, Optional
 import sys
-import time
 import warnings
 
+import guidance
 import psutil
 import torch
 from transformers import (
@@ -30,6 +32,9 @@ from transformers.generation.logits_process import (
 from fastchat.conversation import get_conv_template, SeparatorStyle
 from fastchat.model.model_adapter import load_model, get_conversation_template
 from fastchat.model.chatglm_model import chatglm_generate_stream
+from fastchat.utils import build_logger
+
+logger = build_logger("inference", f"inference.log")
 
 
 def prepare_logits_processor(
@@ -53,6 +58,40 @@ def partial_stop(output, stop_str):
         if stop_str.startswith(output[-i:]):
             return True
     return False
+
+
+def generate_guidance(llm, tokenizer, params: dict):
+    # parse inputs
+    input_dict = json.loads(params["prompt"])
+    prompt: str = input_dict["prompt"]
+    arguments: dict = input_dict["arguments"]
+
+    # run guidance program
+    program = guidance(prompt, llm=llm)
+    out = program(**arguments)
+    variables = out.variables()
+    del variables["llm"]  # delete complex field
+    logger.info(str(variables))
+    # count tokens
+    prompt_token_len = len(tokenizer.tokenize(prompt))
+    # TODO: might not be accurate since all input key-value pairs are also in variables
+    completion_token_len = sum(
+        [len(tokenizer.tokenize(o)) for o in variables.values() if isinstance(o, str)]
+    )
+
+    yield {
+        "text": json.dumps(variables, ensure_ascii=False),
+        "usage": {
+            "prompt_tokens": prompt_token_len,
+            "completion_tokens": completion_token_len,
+            "total_tokens": prompt_token_len + completion_token_len,
+        },
+    }
+
+    # clean
+    guidance.llms.OpenAI.cache.clear()  # comment this when want to cache
+    gc.collect()
+    torch.cuda.empty_cache()
 
 
 @torch.inference_mode()
@@ -308,17 +347,8 @@ def chat_loop(
 
         chatio.prompt_for_output(conv.roles[1])
         output_stream = generate_stream_func(model, tokenizer, gen_params, device)
-        t = time.time()
         outputs = chatio.stream_output(output_stream)
-        duration = time.time() - t
         conv.update_last_message(outputs.strip())
 
         if debug:
-            num_tokens = len(tokenizer.encode(outputs))
-            msg = {
-                "conv_template": conv.name,
-                "prompt": prompt,
-                "outputs": outputs,
-                "speed (token/s)": round(num_tokens / duration, 2),
-            }
-            print(f"\n{msg}\n")
+            print("\n", {"prompt": prompt, "outputs": outputs}, "\n")
