@@ -1,10 +1,10 @@
-# FastChat
+# FastChatWithGuidanceServing
 
 (See [README_original.md](README_original.md) for the original FastChat Readme.)
 
 This project derives from [FastChat](https://github.com/lm-sys/FastChat) with **enhanced serving features**:
 
-Besides the original Openai APIs (v1/completion, v1/chat/completion), we also support [Guidance](https://github.com/microsoft/guidance) for serving (v1/guidance/completion)
+Besides the original Openai APIs (v1/completion, v1/chat/completion), we also support [Guidance](https://github.com/microsoft/guidance) for serving (v1/guidance/completion), making the LLM generation much more controllable than just prompt engineering.
 
 See [openai_api.md](docs/openai_api.md) for more details
 
@@ -105,6 +105,8 @@ res = requests.post(url, headers=headers, json=data)
 text = res.json()["choices"][0]["text"]
 print(json.loads(text))
 ```
+
+The output should look like the following:
 
 ```json
 {
