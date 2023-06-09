@@ -29,7 +29,7 @@ pip3 install --upgrade pip  # enable PEP 660 support
 pip3 install -e .
 ```
 
-## Guidance Usage for Local models
+## Guidance Usage for Public LLMs
 
 ### Sample 1
 
